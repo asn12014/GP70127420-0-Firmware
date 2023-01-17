@@ -12,6 +12,8 @@ char receivedBytes[numChars]; //used for serial recieve
 boolean newData = false;      //used for serial recieve
 char *record1;                //used for serial recieve
 char *p, *i;                  //used for serial recieve
+unsigned long startTime = 0;   //inactivity timer start time
+bool updateSinceReset = false; //tracks if parameters have been updated since last reset
 
 // set up the speed, data order and data mode
 //SettingsB is AD5270, <50 MHz, MSB first, sample on falling clock
@@ -20,7 +22,7 @@ SPISettings settingsB(5000000, MSBFIRST, SPI_MODE1);
 void setup() {
   Serial.begin(38400); // Initialize serial communication at 38400 bits per second
 
-  pinMode(0, INPUT); // ALEX TRYING TO FIX RX PINS
+  pinMode(0, INPUT); // Fixes RX pin weirdness
 
   pinMode(2, OUTPUT);  //CS1 for U6, rheostat for Vfil
   digitalWrite(2,HIGH);
@@ -28,8 +30,10 @@ void setup() {
   digitalWrite(3,LOW); //Start off disabled
   pinMode(4, OUTPUT);  //gridV_disable
   digitalWrite(4,HIGH); //Start off disabled
-  pinMode(5, OUTPUT);  //CS2 for U11, rheostat for V grid bus
-  digitalWrite(5,HIGH);
+  pinMode(6, OUTPUT);  //CS2 for U11, rheostat for V grid bus
+  digitalWrite(6,HIGH);
+  pinMode(5, OUTPUT);  //Filament slow-start bypass enable flag
+  digitalWrite(5,LOW);  //Filament slow-start enabled at power-on
   
   SPI.begin(); // initialize SPI
   delay(2000);
@@ -66,10 +70,10 @@ void setup() {
   high = B00011100;  //command 7 0x1C
   lo = B00000010;    // 0x02
   SPI.beginTransaction(settingsB);
-  digitalWrite (5, LOW);
+  digitalWrite (6, LOW);
   SPI.transfer(high); 
   SPI.transfer(lo); 
-  digitalWrite (5, HIGH);
+  digitalWrite (6, HIGH);
   SPI.endTransaction();
   //////////////////
   //control bits: B000001 (6bits)
@@ -78,10 +82,10 @@ void setup() {
   lo = new_Vdes & B11111111; //low 8 bits
   high = B00000100 | ((new_Vdes>>8)&B11); //control bits plus high 2 bits
   SPI.beginTransaction(settingsB);
-  digitalWrite (5, LOW);
+  digitalWrite (6, LOW);
   SPI.transfer(high); 
   SPI.transfer(lo);         
-  digitalWrite (5, HIGH);
+  digitalWrite (6, HIGH);
   SPI.endTransaction();
   /////////////////
 }
@@ -92,13 +96,25 @@ void loop() {
     recvWithStartEndBytes(); //handles serial
     record1 = receivedBytes; //bitches about this. char to *char    
     processNewData();        //parse into variables, check fault, update DACs
+    resetIfIdle();           //watchdog disables system if communications d/c
 }
 
 
 void processNewData() {
   if (newData == true) {
+    startTime = millis();   // reset idle timer if new data is received
     //store parced data in variables
     String temp_S;
+
+    //Fifth number shall be filament slow-start bypass flag. (1 = BYPASS) 
+    temp_S = String(subStr(record1, " ", 5));
+    boolean startup_bypass = temp_S.toInt();
+    if (startup_bypass) {
+      digitalWrite(5, HIGH);
+    }
+    else {
+      digitalWrite(5, LOW);
+    }
 
     //First number is the counts for U6, The filV
     temp_S = String(subStr(record1, " ", 1));
@@ -139,24 +155,24 @@ void processNewData() {
     lo = new_Vdes & B11111111; //low 8 bits
     high = B00000100 | ((new_Vdes>>8)&B11); //control bits plus high 2 bits
     SPI.beginTransaction(settingsB);
-    digitalWrite (5, LOW);
+    digitalWrite (6, LOW);
     SPI.transfer(high); 
     SPI.transfer(lo);         
-    digitalWrite (5, HIGH);
+    digitalWrite (6, HIGH);
     SPI.endTransaction();
     /////////////////
 
     //Fourth number is the grid disable
     temp_S = String(subStr(record1, " ", 4));
     boolean grid_disable  = temp_S.toInt(); 
-
     if (grid_disable) {
       digitalWrite(4,HIGH);
     }
     else {
       digitalWrite(4,LOW);
     }
-   
+
+    updateSinceReset = true;
 
     Serial.println(analogRead(A0)); //Vbus cond
     Serial.println(analogRead(A1)); //Vfil
@@ -166,6 +182,39 @@ void processNewData() {
   }
 }
 
+//Function to disable unit if no serial input containing start byte is received for >10s
+void resetIfIdle() {
+  if (millis() - startTime > 10000 && updateSinceReset)
+  {
+    //code to reset FS/GP outputs
+    digitalWrite(3, LOW);         // filament disable
+    digitalWrite(4, HIGH);        // grid disable
+
+    //update filament & grid voltage rheostats to minimum
+    //control bits: B000001 (6bits)
+    //followed by 10 bits
+    new_Vdes = 1023; //10 bits
+    byte lo = new_Vdes & B11111111; //low 8 bits
+    byte high = B00000100 | ((new_Vdes >> 8)&B11); //control bits plus high 2 bits
+    SPI.beginTransaction(settingsB);
+    digitalWrite (2, LOW);
+    SPI.transfer(high);
+    SPI.transfer(lo);
+    digitalWrite (2, HIGH);
+    SPI.endTransaction();
+    SPI.beginTransaction(settingsB);
+    digitalWrite (6, LOW);
+    SPI.transfer(high);
+    SPI.transfer(lo);
+    digitalWrite (6, HIGH);
+    SPI.endTransaction();
+    /////////////////
+
+    digitalWrite(5, LOW); // Disable filament slow-start bypass
+
+    updateSinceReset = false;
+  }
+}
 
 //UTILITY FUNCTION
 //Serial recieving function
@@ -186,7 +235,7 @@ void recvWithStartEndBytes() {
         }
       }
       else {
-        receivedBytes[ndx] = '\0';            // terminate the string
+        receivedBytes[ndx] = '\0';    // terminate the string
         recvInProgress = false;
         ndx = 0;
         newData = true;
